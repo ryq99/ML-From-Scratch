@@ -15,7 +15,7 @@ class LogisticRegression():
 
             y_pred = self.predict(X)
             loss = torch.mean(- y * torch.log(y_pred) - (1 - y) * torch.log(1 - y_pred))
-            grad_loss = torch.mean(y_pred - y) # The gradient of the loss with respect to the y_pred is: (y_pred - y)
+            grad_loss = torch.mean(y_pred - y) # The gradient of the loss with respect to the logit is: (y_pred - y), which is the chain rule of the derivation of loss with respect to y_pred times the derivative of y_pred with respect to z, the logit (sigmoid function). 
             grad_w = torch.mean(grad_loss * X)
             grad_b = torch.mean(grad_loss)
 
