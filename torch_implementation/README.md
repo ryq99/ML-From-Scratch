@@ -1,1 +1,1 @@
-# Implement ML Algorithms using PyTorch
+# Implement ML Algorithms with PyTorch
