@@ -31,8 +31,12 @@ class LogisticRegression():
 
 if __name__ == "__main__":
 
-    X = torch.randn(200, 1, dtype=torch.float32) # (n, d)
-    y = (3 * X + 2 + torch.randn(200, 1, dtype=torch.float32) * 0.01 > 0.5).float()  # (n, d)
+    X = torch.randn(200, 3, dtype=torch.float32) # (n, d)
+    y = torch.cat(
+        (X @ torch.randn(3, 1, dtype=torch.float32) * 3 + 2 + torch.randn(200, 1, dtype=torch.float32) * 0.01 > 0.5).float(),
+        (X @ torch.randn(3, 1, dtype=torch.float32) * 2 + 1 + torch.randn(200, 1, dtype=torch.float32) * 0.01 > 0.3).float(),
+        dim=-1
+        )  # (n, k) k classes
 
     w_0 = torch.randn(1, 1, dtype=torch.float32) * 0.00001 + 3 # (d, 1)
     b_0 = torch.randn(1, dtype=torch.float32) # scalar
