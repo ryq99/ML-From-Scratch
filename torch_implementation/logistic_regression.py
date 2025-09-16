@@ -28,6 +28,12 @@ class LogisticRegression():
             if (epoch + 1) % 2 == 0:
                 print(f'Epoch [{epoch+1}/{epoches}], Loss: {loss.item():.4f}, Weight: {self.w.item():.4f}, Bias: {self.b.item():.4f}')
 
+def softmax(z):
+    z = z - torch.max(z, dim=-1, keepdim=True)
+    z = torch.exp(z)
+    z = z / torch.sum(z, dim=-1, keepdim=True)
+    return z
+
 
 if __name__ == "__main__":
 
