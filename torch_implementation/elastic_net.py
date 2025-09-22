@@ -10,21 +10,52 @@ class ElasticNet():
     def predict(self, X):
         return X @ self.w + self.b
     
-    def fit(self, X, y, lr=0.01, epochs=1000):
-        for epoch in range(epochs):
+    def fit(self, X, y, lr=0.01, epochs=1000, solver='gd'):
+        if solver == 'gd':
+            for epoch in range(epochs):
 
-            y_pred = self.predict(X)
-            loss = torch.mean(y_pred - y) ** 2 + torch.sum(self.alpha * torch.abs(self.w)) + torch.sum((1 - self.l1_ratio) * self.w ** 2)
-            grad_loss_y_pred = 2 * (y_pred - y)
-            grad_loss_w = torch.mean(torch.transpose(X, 0, 1) @ grad_loss_y_pred) + torch.sum(self.alpha * torch.sign(self.w)) + torch.sum( (1 - self.l1_ratio) * 2 * self.w)
-            grad_loss_b = torch.mean(grad_loss_y_pred)
+                y_pred = self.predict(X)
+                loss = torch.mean((y_pred - y) ** 2) + self.alpha * ( self.l1_ratio * torch.sum(torch.abs(self.w)) + (1 - self.l1_ratio) * torch.sum(self.w ** 2) )
+                grad_loss_y_pred = 2 * (y_pred - y)
+                grad_loss_w = (torch.transpose(X, 0, 1) @ grad_loss_y_pred) / X.shape[0] + self.alpha * (self.l1_ratio * torch.sign(self.w) + (1 - self.l1_ratio) * 2 * self.w)
+                grad_loss_b = torch.mean(grad_loss_y_pred)
 
-            with torch.no_grad():
-                self.w -= lr * grad_loss_w
-                self.b -= lr * grad_loss_b
+                with torch.no_grad():
+                    self.w -= lr * grad_loss_w
+                    self.b -= lr * grad_loss_b
 
-            if epoch % 2 == 0:
-                print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}, Weight: {self.w.squeeze(-1).tolist()}, Bias: {self.b.item():.4f}')
+                if epoch % 2 == 0:
+                    print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}, Weight: {self.w.squeeze(-1).tolist()}, Bias: {self.b.item():.4f}')
+        
+        elif solver == 'sgd':
+            torch.manual_seed(42)
+            grads_w_all_samples = torch.zeros(len(self.X), len(self.w))
+            grads_b_all_samples = torch.zeros(len(self.X), 1)
+
+            for epoch in range(epochs):
+                idx = torch.randint(0, X.shape[0], (1,)).item()
+                x_sample = X[idx:idx+1, :]
+                y_sample = y[idx:idx+1, :]
+                
+                y_pred_sample = self.predict(x_sample)
+                loss = (y_pred_sample - y_sample) ** 2 + self.alpha * (self.l1_ratio * torch.abs(self.w) + (1 - self.l1_ratio) * self.w ** 2)
+                grad_loss_y_pred = 2 * (y_pred_sample - y_sample)
+                grad_loss_w = torch.transpose(x_sample, 0, 1) @ grad_loss_y_pred + self.alpha * (self.l1_ratio * torch.sign(self.w) + (1 - self.l1_ratio) ** 2 * self.w)
+                grad_loss_b = grad_loss_y_pred
+                grads_w_all_samples[idx, :] = grad_loss_w.reshape(-1)
+                grads_b_all_samples[idx, :] = grad_loss_b.reshape(-1)
+
+                with torch.no_grad():
+                    self.w -= lr * grad_loss_w
+                    self.b -= lr * grad_loss_b
+                
+                if epoch % 2 == 0:
+                    print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}, Weight: {self.w.squeeze(-1).tolist()}, Bias: {self.b.item():.4f}')
+
+
+
+
+
 
 
 if __name__ == "__main__":
