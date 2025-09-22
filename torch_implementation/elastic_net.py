@@ -10,13 +10,13 @@ class ElasticNet():
     def predict(self, X):
         return X @ self.w + self.b
     
-    def fit(self, X, y, lr=0.01, epochs=1000):
+    def fit(self, X, y, lr=0.01, epochs=1000, solver='gd'):
         for epoch in range(epochs):
 
             y_pred = self.predict(X)
-            loss = torch.mean(y_pred - y) ** 2 + torch.sum(self.alpha * torch.abs(self.w)) + torch.sum((1 - self.l1_ratio) * self.w ** 2)
+            loss = torch.mean((y_pred - y) ** 2) + self.alpha * ( self.l1_ratio * torch.sum(torch.abs(self.w)) + (1 - self.l1_ratio) * torch.sum(self.w ** 2) )
             grad_loss_y_pred = 2 * (y_pred - y)
-            grad_loss_w = torch.mean(torch.transpose(X, 0, 1) @ grad_loss_y_pred) + torch.sum(self.alpha * torch.sign(self.w)) + torch.sum( (1 - self.l1_ratio) * 2 * self.w)
+            grad_loss_w = (torch.transpose(X, 0, 1) @ grad_loss_y_pred) / X.shape[0] + self.alpha * (self.l1_ratio * torch.sign(self.w) + (1 - self.l1_ratio) * 2 * self.w)
             grad_loss_b = torch.mean(grad_loss_y_pred)
 
             with torch.no_grad():
@@ -25,7 +25,6 @@ class ElasticNet():
 
             if epoch % 2 == 0:
                 print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}, Weight: {self.w.squeeze(-1).tolist()}, Bias: {self.b.item():.4f}')
-
 
 if __name__ == "__main__":
     X = torch.randn(200, 3, dtype=torch.float32)
