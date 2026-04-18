@@ -64,7 +64,14 @@ import torch
 
 class RidgeRegressionTorch:
     """
-    Ridge regression with raw PyTorch tensors.
+    Ridge regression with raw PyTorch tensors and manual gradients.
+    No autograd — gradients derived analytically.
+
+    Forward:  y_hat = X @ w + b
+    Loss:     L = (1/n)*||y_hat - y||^2 + alpha*||w||^2
+    Gradients:
+        dL/dw = (2/n) * X^T @ (y_hat - y)  +  2*alpha*w
+        dL/db = (2/n) * sum(y_hat - y)
 
     Parameters
     ----------
@@ -89,26 +96,22 @@ class RidgeRegressionTorch:
         y = torch.tensor(y, dtype=torch.float32)
         n, d = X.shape
 
-        self.w = torch.zeros(d, requires_grad=True)
-        self.b = torch.zeros(1, requires_grad=True)
+        self.w = torch.zeros(d)
+        self.b = torch.zeros(1)
 
         for _ in range(self.n_iters):
-            y_hat = X @ self.w + self.b
-            mse = ((y_hat - y) ** 2).mean()
-            l2 = self.alpha * (self.w ** 2).sum()
-            loss = mse + l2
+            y_hat = X @ self.w + self.b            # (n,)
+            error = y_hat - y                      # (n,)
 
-            loss.backward()
-            with torch.no_grad():
-                self.w -= self.lr * self.w.grad
-                self.b -= self.lr * self.b.grad
-            self.w.grad.zero_()
-            self.b.grad.zero_()
+            dw = (2 / n) * X.T @ error + 2 * self.alpha * self.w  # (d,)
+            db = (2 / n) * error.sum()             # scalar
+
+            self.w -= self.lr * dw
+            self.b -= self.lr * db
 
         return self
 
     def predict(self, X) -> np.ndarray:
         """Returns predictions as numpy array, shape (n_samples,)."""
         X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            return (X @ self.w + self.b).numpy()
+        return (X @ self.w + self.b).numpy()

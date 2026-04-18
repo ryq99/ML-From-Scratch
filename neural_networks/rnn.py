@@ -246,7 +246,24 @@ import torch
 
 class VanillaRNNTorch:
     """
-    Vanilla RNN with raw PyTorch tensors + autograd.
+    Vanilla RNN with raw PyTorch tensors and manual BPTT.
+    No autograd — every gradient computed explicitly, identical math to
+    VanillaRNNNumPy.
+
+    Forward (per timestep t):
+        h_t = tanh(x_t @ W_xh + h_{t-1} @ W_hh + b_h)
+    Output:
+        logits = h_T @ W_hy + b_y
+
+    Backward (BPTT, unrolled from t=T-1 to t=0):
+        d_logits = (probs - Y_onehot) / n
+        dW_hy += h_T.T @ d_logits
+        dh    = d_logits @ W_hy.T
+        dtanh = dh * (1 - h_t^2)          # tanh' = 1 - tanh^2
+        dW_xh += x_t.T @ dtanh
+        dW_hh += h_{t-1}.T @ dtanh
+        db_h  += dtanh.sum(dim=0)
+        dh     = dtanh @ W_hh.T            # pass gradient to previous step
 
     Parameters
     ----------
@@ -263,21 +280,58 @@ class VanillaRNNTorch:
         self.lr = lr
         self.n_iters = n_iters
         scale = 0.01
-        self.W_xh = (torch.randn(input_size,  hidden_size) * scale).requires_grad_(True)
-        self.W_hh = (torch.randn(hidden_size, hidden_size) * scale).requires_grad_(True)
-        self.b_h  = torch.zeros(hidden_size, requires_grad=True)
-        self.W_hy = (torch.randn(hidden_size, output_size) * scale).requires_grad_(True)
-        self.b_y  = torch.zeros(output_size, requires_grad=True)
+        self.W_xh = torch.randn(input_size,  hidden_size) * scale
+        self.W_hh = torch.randn(hidden_size, hidden_size) * scale
+        self.b_h  = torch.zeros(hidden_size)
+        self.W_hy = torch.randn(hidden_size, output_size) * scale
+        self.b_y  = torch.zeros(output_size)
 
-    def _params(self):
-        return [self.W_xh, self.W_hh, self.b_h, self.W_hy, self.b_y]
+    @staticmethod
+    def _softmax(z: torch.Tensor) -> torch.Tensor:
+        z = z - z.max(dim=1, keepdim=True).values
+        e = torch.exp(z)
+        return e / e.sum(dim=1, keepdim=True)
 
-    def _forward(self, X: torch.Tensor) -> torch.Tensor:
+    def _forward(self, X: torch.Tensor):
+        """Returns logits and cached hidden states for BPTT."""
         n, T, _ = X.shape
         h = torch.zeros(n, self.hidden_size)
+        hs = [h]
         for t in range(T):
             h = torch.tanh(X[:, t, :] @ self.W_xh + h @ self.W_hh + self.b_h)
-        return h @ self.W_hy + self.b_y   # (n, output_size)
+            hs.append(h)
+        logits = hs[-1] @ self.W_hy + self.b_y   # (n, output_size)
+        return logits, hs
+
+    def _backward(self, logits: torch.Tensor, hs, X: torch.Tensor, y: torch.Tensor):
+        n, T, _ = X.shape
+        probs = self._softmax(logits)
+
+        # Output layer gradient
+        y_oh = torch.zeros_like(probs)
+        y_oh[torch.arange(n), y.long()] = 1.0
+        d_logits = (probs - y_oh) / n              # (n, K)
+
+        dW_hy = hs[-1].T @ d_logits               # (H, K)
+        db_y  = d_logits.sum(dim=0)               # (K,)
+        dh    = d_logits @ self.W_hy.T             # (n, H)  — seed for BPTT
+
+        dW_xh = torch.zeros_like(self.W_xh)
+        dW_hh = torch.zeros_like(self.W_hh)
+        db_h  = torch.zeros_like(self.b_h)
+
+        for t in reversed(range(T)):
+            dtanh = dh * (1 - hs[t + 1] ** 2)    # tanh'(z) = 1 - tanh(z)^2
+            dW_xh += X[:, t, :].T @ dtanh
+            dW_hh += hs[t].T @ dtanh
+            db_h  += dtanh.sum(dim=0)
+            dh     = dtanh @ self.W_hh.T           # gradient to previous step
+
+        # Clip to prevent exploding gradients
+        for g in [dW_xh, dW_hh, db_h, dW_hy, db_y]:
+            g.clamp_(-5, 5)
+
+        return dW_xh, dW_hh, db_h, dW_hy, db_y
 
     def fit(self, X, y) -> "VanillaRNNTorch":
         """
@@ -288,27 +342,48 @@ class VanillaRNNTorch:
         y_t = torch.tensor(y, dtype=torch.long)
 
         for _ in range(self.n_iters):
-            logits = self._forward(X_t)
-            log_sum_exp = torch.logsumexp(logits, dim=1)
-            loss = (-logits[torch.arange(len(y_t)), y_t] + log_sum_exp).mean()
-
-            loss.backward()
-            with torch.no_grad():
-                for p in self._params():
-                    p -= self.lr * p.grad
-                    p.grad.zero_()
+            logits, hs = self._forward(X_t)
+            dW_xh, dW_hh, db_h, dW_hy, db_y = self._backward(logits, hs, X_t, y_t)
+            self.W_xh -= self.lr * dW_xh
+            self.W_hh -= self.lr * dW_hh
+            self.b_h  -= self.lr * db_h
+            self.W_hy -= self.lr * dW_hy
+            self.b_y  -= self.lr * db_y
 
         return self
 
     def predict(self, X) -> np.ndarray:
         X_t = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            return self._forward(X_t).argmax(dim=1).numpy()
+        logits, _ = self._forward(X_t)
+        return logits.argmax(dim=1).numpy()
 
 
 class LSTMTorch:
     """
-    LSTM with raw PyTorch tensors + autograd.
+    LSTM with raw PyTorch tensors and manual BPTT.
+    No autograd — every gradient computed explicitly, identical math to
+    LSTMNumPy.
+
+    Forward (per timestep t):
+        xh_t = [x_t, h_{t-1}]                    concat input and prev hidden
+        gates = xh_t @ W + b                      (n, 4H)
+        f_t = sigma(gates[:H])                    forget gate
+        i_t = sigma(gates[H:2H])                  input gate
+        g_t = tanh( gates[2H:3H])                 cell gate
+        o_t = sigma(gates[3H:])                   output gate
+        c_t = f_t * c_{t-1} + i_t * g_t
+        h_t = o_t * tanh(c_t)
+
+    Backward (BPTT, gate-level chain rule):
+        do   = dh * tanh(c)
+        dc  += dh * o * (1 - tanh(c)^2)
+        df   = dc * c_{t-1}
+        di   = dc * g
+        dg   = dc * i
+        dc   = dc * f                              (pass to previous step)
+        d_gates = concat(df*f*(1-f), di*i*(1-i), dg*(1-g^2), do*o*(1-o))
+        dW  += xh.T @ d_gates
+        dh   = (d_gates @ W.T)[:, -H:]            (pass to previous step)
 
     Parameters
     ----------
@@ -327,30 +402,93 @@ class LSTMTorch:
         D = input_size + hidden_size
         H = hidden_size
         scale = 0.01
-        # Single weight matrix for all 4 gates
-        self.W   = (torch.randn(D, 4 * H) * scale).requires_grad_(True)
-        self.b   = torch.zeros(4 * H, requires_grad=True)
-        self.W_y = (torch.randn(H, output_size) * scale).requires_grad_(True)
-        self.b_y = torch.zeros(output_size, requires_grad=True)
+        self.W   = torch.randn(D, 4 * H) * scale
+        self.b   = torch.zeros(4 * H)
+        self.W_y = torch.randn(H, output_size) * scale
+        self.b_y = torch.zeros(output_size)
 
-    def _params(self):
-        return [self.W, self.b, self.W_y, self.b_y]
+    @staticmethod
+    def _sigmoid(z: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + torch.exp(-torch.clamp(z, -500, 500)))
 
-    def _forward(self, X: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _softmax(z: torch.Tensor) -> torch.Tensor:
+        z = z - z.max(dim=1, keepdim=True).values
+        e = torch.exp(z)
+        return e / e.sum(dim=1, keepdim=True)
+
+    def _lstm_step(self, x_t, h_prev, c_prev):
+        H = self.hidden_size
+        xh    = torch.cat([x_t, h_prev], dim=1)   # (n, D)
+        gates = xh @ self.W + self.b               # (n, 4H)
+        f = self._sigmoid(gates[:, :H])
+        i = self._sigmoid(gates[:, H:2*H])
+        g = torch.tanh(gates[:, 2*H:3*H])
+        o = self._sigmoid(gates[:, 3*H:])
+        c = f * c_prev + i * g
+        h = o * torch.tanh(c)
+        cache = (xh, f, i, g, o, c, c_prev, h_prev)
+        return h, c, cache
+
+    def _forward(self, X: torch.Tensor):
         n, T, _ = X.shape
         H = self.hidden_size
         h = torch.zeros(n, H)
         c = torch.zeros(n, H)
+        caches = []
         for t in range(T):
-            xh = torch.cat([X[:, t, :], h], dim=1)   # (n, D)
-            gates = xh @ self.W + self.b               # (n, 4H)
-            f = torch.sigmoid(gates[:, :H])
-            i = torch.sigmoid(gates[:, H:2*H])
-            g = torch.tanh(gates[:, 2*H:3*H])
-            o = torch.sigmoid(gates[:, 3*H:])
-            c = f * c + i * g
-            h = o * torch.tanh(c)
-        return h @ self.W_y + self.b_y
+            h, c, cache = self._lstm_step(X[:, t, :], h, c)
+            caches.append(cache)
+        logits = h @ self.W_y + self.b_y
+        return logits, caches, h
+
+    def _backward(self, logits, caches, h_last, y):
+        n = len(y)
+        H = self.hidden_size
+        T = len(caches)
+        probs = self._softmax(logits)
+
+        # Output layer
+        y_oh = torch.zeros_like(probs)
+        y_oh[torch.arange(n), y.long()] = 1.0
+        d_logits = (probs - y_oh) / n
+
+        dW_y = h_last.T @ d_logits               # (H, K)
+        db_y = d_logits.sum(dim=0)               # (K,)
+        dh   = d_logits @ self.W_y.T             # (n, H)
+
+        dW = torch.zeros_like(self.W)
+        db = torch.zeros_like(self.b)
+        dc = torch.zeros(n, H)
+
+        for t in reversed(range(T)):
+            xh, f, i, g, o, c, c_prev, h_prev = caches[t]
+            tc = torch.tanh(c)
+
+            do   = dh * tc                        # dL/do_t
+            dc  += dh * o * (1 - tc ** 2)        # dL/dc_t  (tanh')
+            df   = dc * c_prev                   # dL/df_t
+            di   = dc * g                        # dL/di_t
+            dg   = dc * i                        # dL/dg_t
+            dc   = dc * f                        # dL/dc_{t-1}  (pass back)
+
+            # Gate pre-activation gradients (multiply by gate derivative)
+            d_gates = torch.cat([
+                df * f * (1 - f),                # sigmoid'(f)
+                di * i * (1 - i),                # sigmoid'(i)
+                dg * (1 - g ** 2),               # tanh'(g)
+                do * o * (1 - o),                # sigmoid'(o)
+            ], dim=1)                             # (n, 4H)
+
+            dW += xh.T @ d_gates
+            db += d_gates.sum(dim=0)
+            dxh = d_gates @ self.W.T
+            dh  = dxh[:, -H:]                    # gradient to previous h
+
+        for g in [dW, db, dW_y, db_y]:
+            g.clamp_(-5, 5)
+
+        return dW, db, dW_y, db_y
 
     def fit(self, X, y) -> "LSTMTorch":
         """
@@ -361,19 +499,16 @@ class LSTMTorch:
         y_t = torch.tensor(y, dtype=torch.long)
 
         for _ in range(self.n_iters):
-            logits = self._forward(X_t)
-            log_sum_exp = torch.logsumexp(logits, dim=1)
-            loss = (-logits[torch.arange(len(y_t)), y_t] + log_sum_exp).mean()
-
-            loss.backward()
-            with torch.no_grad():
-                for p in self._params():
-                    p -= self.lr * p.grad
-                    p.grad.zero_()
+            logits, caches, h_last = self._forward(X_t)
+            dW, db, dW_y, db_y = self._backward(logits, caches, h_last, y_t)
+            self.W   -= self.lr * dW
+            self.b   -= self.lr * db
+            self.W_y -= self.lr * dW_y
+            self.b_y -= self.lr * db_y
 
         return self
 
     def predict(self, X) -> np.ndarray:
         X_t = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            return self._forward(X_t).argmax(dim=1).numpy()
+        logits, _, _ = self._forward(X_t)
+        return logits.argmax(dim=1).numpy()

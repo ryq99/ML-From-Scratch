@@ -70,8 +70,14 @@ import torch
 
 class SVMTorch:
     """
-    Linear SVM with raw PyTorch tensors.
-    Minimizes hinge loss + L2 penalty via autograd.
+    Linear SVM with raw PyTorch tensors and manual subgradient computation.
+    No autograd — subgradients derived analytically.
+
+    Objective:  L = (1/n)*sum_i max(0, 1 - y_i*(w·x_i+b))  +  C*||w||^2
+    Subgradients (for sample i, let m_i = y_i*(w·x_i+b)):
+        if m_i < 1:  dL/dw += -y_i*x_i / n,  dL/db += -y_i / n
+        else:        no contribution from hinge term
+    L2 term always contributes:  dL/dw += 2*C*w  (not regularizing b)
 
     Parameters
     ----------
@@ -96,27 +102,29 @@ class SVMTorch:
         y = torch.tensor(y, dtype=torch.float32)
         n, d = X.shape
 
-        self.w = torch.zeros(d, requires_grad=True)
-        self.b = torch.zeros(1, requires_grad=True)
+        self.w = torch.zeros(d)
+        self.b = torch.zeros(1)
 
         for _ in range(self.n_iters):
-            margins = y * (X @ self.w + self.b)
-            hinge = torch.clamp(1 - margins, min=0).mean()
-            l2 = (self.w ** 2).sum()
-            loss = hinge + self.C * l2
+            margins = y * (X @ self.w + self.b)    # (n,)
+            mask = margins < 1                     # support vectors (bool mask)
 
-            loss.backward()
-            with torch.no_grad():
-                self.w -= self.lr * self.w.grad
-                self.b -= self.lr * self.b.grad
-            self.w.grad.zero_()
-            self.b.grad.zero_()
+            # Subgradient of hinge loss
+            if mask.any():
+                # (X[mask] * y[mask, None]): contributions of misclassified/margin samples
+                dw = self.w - self.C * (X[mask] * y[mask, None]).mean(dim=0)
+                db = -self.C * y[mask].mean()
+            else:
+                dw = self.w.clone()
+                db = torch.zeros(1)
+
+            self.w -= self.lr * dw
+            self.b -= self.lr * db
 
         return self
 
     def predict(self, X) -> np.ndarray:
         """Returns predicted labels in {-1, +1}, shape (n,)."""
         X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            scores = X @ self.w + self.b
+        scores = X @ self.w + self.b
         return np.sign(scores.numpy()).astype(int)
