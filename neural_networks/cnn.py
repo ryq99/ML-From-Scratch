@@ -193,10 +193,23 @@ import torch
 
 class CNNTorch:
     """
-    CNN with raw PyTorch tensors using torch.nn.functional.conv2d for
-    the convolution (but with manually managed weight tensors and gradients).
+    CNN with raw PyTorch tensors and full manual backpropagation.
+    No autograd, no F.conv2d — every operation (conv, pool, relu, fc) is
+    implemented with explicit forward + backward passes, identical math to
+    CNNNumPy but using torch tensors instead of numpy arrays.
 
     Architecture: Conv2D → ReLU → MaxPool → Flatten → Linear
+
+    Backward pass summary:
+        FC:      d_logits = (probs - Y_onehot) / n
+                 dW_fc = flat.T @ d_logits
+                 db_fc = d_logits.sum(dim=0)
+                 d_flat = d_logits @ W_fc.T
+        MaxPool: gradient flows only to the max position (max-mask)
+        ReLU:    d_relu = d_pool * (conv_out > 0)
+        Conv:    dW[f] += sum over patches: dout[n,f,i,j] * patch
+                 dX at patch += dout[n,f,i,j] * W[f]
+                 db = dout.sum over n,i,j
 
     Parameters
     ----------
@@ -221,16 +234,86 @@ class CNNTorch:
         self.W_fc:   torch.Tensor = None
         self.b_fc:   torch.Tensor = None
 
-    def _params(self):
-        return [self.W_conv, self.b_conv, self.W_fc, self.b_fc]
+    # ── Conv helpers ──────────────────────────────────────────────────────────
+
+    def _conv_forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        X : (n, C, H, W)
+        Returns: (n, n_filters, H_out, W_out)
+        """
+        n, C, H, W = X.shape
+        k = self.kernel_size
+        H_out = H - k + 1
+        W_out = W - k + 1
+        out = torch.zeros(n, self.n_filters, H_out, W_out)
+        for f in range(self.n_filters):
+            for i in range(H_out):
+                for j in range(W_out):
+                    patch = X[:, :, i:i+k, j:j+k]           # (n, C, k, k)
+                    out[:, f, i, j] = (patch * self.W_conv[f]).sum(dim=(1, 2, 3)) + self.b_conv[f]
+        return out
+
+    def _conv_backward(self, dout: torch.Tensor, X: torch.Tensor):
+        """
+        dout : (n, n_filters, H_out, W_out)
+        Returns dX, dW_conv, db_conv
+        """
+        n, C, H, W = X.shape
+        k = self.kernel_size
+        H_out, W_out = dout.shape[2], dout.shape[3]
+        dX      = torch.zeros_like(X)
+        dW_conv = torch.zeros_like(self.W_conv)
+        db_conv = dout.sum(dim=(0, 2, 3))             # (n_filters,)
+
+        for f in range(self.n_filters):
+            for i in range(H_out):
+                for j in range(W_out):
+                    patch = X[:, :, i:i+k, j:j+k]           # (n, C, k, k)
+                    # dout[:, f, i, j] : (n,)  →  unsqueeze to (n,1,1,1) for broadcast
+                    d = dout[:, f, i, j].reshape(n, 1, 1, 1)
+                    dW_conv[f] += (d * patch).sum(dim=0)     # (C, k, k)
+                    dX[:, :, i:i+k, j:j+k] += d * self.W_conv[f]  # distribute to input
+        return dX, dW_conv, db_conv
+
+    # ── MaxPool helpers ───────────────────────────────────────────────────────
+
+    def _maxpool_forward(self, X: torch.Tensor):
+        """X : (n, C, H, W) → (n, C, H//p, W//p), also returns max-position mask."""
+        p = self.pool_size
+        n, C, H, W = X.shape
+        H_p, W_p = H // p, W // p
+        out  = torch.zeros(n, C, H_p, W_p)
+        mask = torch.zeros_like(X, dtype=torch.bool)
+        for i in range(H_p):
+            for j in range(W_p):
+                window = X[:, :, i*p:(i+1)*p, j*p:(j+1)*p]          # (n,C,p,p)
+                max_val = window.reshape(n, C, -1).max(dim=2).values  # (n,C)
+                out[:, :, i, j] = max_val
+                mask[:, :, i*p:(i+1)*p, j*p:(j+1)*p] = (
+                    window == max_val.unsqueeze(-1).unsqueeze(-1)
+                )
+        return out, mask
+
+    def _maxpool_backward(self, dout: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Gradient flows only to the max position in each window."""
+        p = self.pool_size
+        dX = torch.zeros_like(mask, dtype=torch.float32)
+        H_p, W_p = dout.shape[2], dout.shape[3]
+        for i in range(H_p):
+            for j in range(W_p):
+                dX[:, :, i*p:(i+1)*p, j*p:(j+1)*p] = (
+                    mask[:, :, i*p:(i+1)*p, j*p:(j+1)*p].float()
+                    * dout[:, :, i, j].unsqueeze(-1).unsqueeze(-1)
+                )
+        return dX
+
+    # ── Training ──────────────────────────────────────────────────────────────
 
     def fit(self, X, y) -> "CNNTorch":
         """
         X : array-like (n, C, H, W)
         y : array-like (n,)  integer labels
         """
-        import torch.nn.functional as F
-
         X_t = torch.tensor(X, dtype=torch.float32)
         y_t = torch.tensor(y, dtype=torch.long)
         n, C, H, W = X_t.shape
@@ -242,38 +325,52 @@ class CNNTorch:
         W_p = W_c // p
         fc_in = self.n_filters * H_p * W_p
 
-        self.W_conv = (torch.randn(self.n_filters, C, k, k) * 0.1).requires_grad_(True)
-        self.b_conv = torch.zeros(self.n_filters, requires_grad=True)
-        self.W_fc   = (torch.randn(fc_in, self.n_classes) * 0.1).requires_grad_(True)
-        self.b_fc   = torch.zeros(self.n_classes, requires_grad=True)
+        self.W_conv = torch.randn(self.n_filters, C, k, k) * 0.1
+        self.b_conv = torch.zeros(self.n_filters)
+        self.W_fc   = torch.randn(fc_in, self.n_classes) * 0.1
+        self.b_fc   = torch.zeros(self.n_classes)
 
         for _ in range(self.n_iters):
-            # Forward
-            conv_out = F.conv2d(X_t, self.W_conv, self.b_conv)  # (n,F,Hc,Wc)
-            relu_out = torch.relu(conv_out)
-            pool_out = F.max_pool2d(relu_out, kernel_size=p)     # (n,F,Hp,Wp)
-            flat     = pool_out.reshape(n, -1)                   # (n, fc_in)
-            logits   = flat @ self.W_fc + self.b_fc              # (n, K)
+            # ── Forward ───────────────────────────────────────────────────
+            conv_out = self._conv_forward(X_t)             # (n,F,Hc,Wc)
+            relu_out = torch.clamp(conv_out, min=0)        # ReLU
+            pool_out, pool_mask = self._maxpool_forward(relu_out)
+            flat    = pool_out.reshape(n, -1)              # (n, fc_in)
+            logits  = flat @ self.W_fc + self.b_fc         # (n, K)
 
-            # Cross-entropy loss
-            log_sum_exp = torch.logsumexp(logits, dim=1)
-            loss = (-logits[torch.arange(n), y_t] + log_sum_exp).mean()
+            # Softmax (numerically stable) + cross-entropy
+            logits_s = logits - logits.max(dim=1, keepdim=True).values
+            exp_l    = torch.exp(logits_s)
+            probs    = exp_l / exp_l.sum(dim=1, keepdim=True)   # (n, K)
 
-            loss.backward()
-            with torch.no_grad():
-                for p_param in self._params():
-                    p_param -= self.lr * p_param.grad
-                    p_param.grad.zero_()
+            # ── Backward ──────────────────────────────────────────────────
+            y_oh = torch.zeros_like(probs)
+            y_oh[torch.arange(n), y_t] = 1.0
+            d_logits = (probs - y_oh) / n                  # (n, K)
+
+            dW_fc = flat.T @ d_logits                      # (fc_in, K)
+            db_fc = d_logits.sum(dim=0)                    # (K,)
+            d_flat = d_logits @ self.W_fc.T                # (n, fc_in)
+
+            d_pool = d_flat.reshape(pool_out.shape)        # (n,F,Hp,Wp)
+            d_relu = self._maxpool_backward(d_pool, pool_mask)
+            d_conv = d_relu * (conv_out > 0).float()       # ReLU grad
+
+            _, dW_conv, db_conv = self._conv_backward(d_conv, X_t)
+
+            # ── Update ────────────────────────────────────────────────────
+            self.W_fc   -= self.lr * dW_fc
+            self.b_fc   -= self.lr * db_fc
+            self.W_conv -= self.lr * dW_conv
+            self.b_conv -= self.lr * db_conv
 
         return self
 
     def predict(self, X) -> np.ndarray:
-        import torch.nn.functional as F
         X_t = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            conv_out = F.conv2d(X_t, self.W_conv, self.b_conv)
-            relu_out = torch.relu(conv_out)
-            pool_out = F.max_pool2d(relu_out, kernel_size=self.pool_size)
-            flat     = pool_out.reshape(len(X_t), -1)
-            logits   = flat @ self.W_fc + self.b_fc
+        conv_out = self._conv_forward(X_t)
+        relu_out = torch.clamp(conv_out, min=0)
+        pool_out, _ = self._maxpool_forward(relu_out)
+        flat   = pool_out.reshape(len(X_t), -1)
+        logits = flat @ self.W_fc + self.b_fc
         return logits.argmax(dim=1).numpy()

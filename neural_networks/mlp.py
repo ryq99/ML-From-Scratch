@@ -127,8 +127,22 @@ import torch
 
 class MLPTorch:
     """
-    MLP with raw PyTorch tensors.  Weights stored as tensors with requires_grad.
-    Uses full-batch gradient descent; no nn.Module.
+    MLP with raw PyTorch tensors and full manual backpropagation.
+    No autograd, no nn.Module — every gradient computed explicitly by chain rule,
+    identical math to MLPNumPy.
+
+    Forward (per layer l):
+        z^l = a^{l-1} @ W^l + b^l
+        a^l = relu(z^l)          for hidden layers
+        a^L = softmax(z^L)       for classification output
+        a^L = z^L                for regression output
+
+    Backward:
+        Output delta (classification):  delta^L = (1/n)*(a^L - Y_onehot)
+        Output delta (regression):      delta^L = (2/n)*(a^L - y)
+        Hidden delta:  delta^l = (delta^{l+1} @ W^{l+1}.T) * relu'(z^l)
+        Weight grad:   dW^l = (a^{l-1}).T @ delta^l
+        Bias grad:     db^l = sum(delta^l, dim=0)
 
     Parameters
     ----------
@@ -149,34 +163,69 @@ class MLPTorch:
         self.weights: List[torch.Tensor] = []
         self.biases:  List[torch.Tensor] = []
 
+    @staticmethod
+    def _relu(z: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(z, min=0)
+
+    @staticmethod
+    def _relu_grad(z: torch.Tensor) -> torch.Tensor:
+        return (z > 0).float()
+
+    @staticmethod
+    def _softmax(z: torch.Tensor) -> torch.Tensor:
+        z = z - z.max(dim=1, keepdim=True).values
+        e = torch.exp(z)
+        return e / e.sum(dim=1, keepdim=True)
+
     def _init_weights(self, n_features: int):
         sizes = [n_features] + self.layer_sizes + [self.n_outputs]
         self.weights = []
         self.biases  = []
         for i in range(len(sizes) - 1):
-            scale = (2.0 / sizes[i]) ** 0.5
-            W = torch.randn(sizes[i], sizes[i + 1]) * scale
-            W.requires_grad_(True)
-            b = torch.zeros(sizes[i + 1], requires_grad=True)
-            self.weights.append(W)
-            self.biases.append(b)
+            scale = (2.0 / sizes[i]) ** 0.5     # He initialization
+            self.weights.append(torch.randn(sizes[i], sizes[i + 1]) * scale)
+            self.biases.append(torch.zeros(sizes[i + 1]))
 
-    def _forward(self, X: torch.Tensor) -> torch.Tensor:
+    def _forward(self, X: torch.Tensor):
+        """Returns (activations list, pre-activations list) — same structure as NumPy."""
+        activations = [X]
+        zs = []
         a = X
         for i, (W, b) in enumerate(zip(self.weights, self.biases)):
             z = a @ W + b
+            zs.append(z)
             is_last = (i == len(self.weights) - 1)
             if is_last and self.task == "classification":
-                # Log-softmax handled in loss; return raw logits
-                a = z
+                a = self._softmax(z)
             elif is_last:
-                a = z
+                a = z                          # linear output
             else:
-                a = torch.relu(z)
-        return a
+                a = self._relu(z)
+            activations.append(a)
+        return activations, zs
 
-    def _params(self):
-        return self.weights + self.biases
+    def _backward(self, activations, zs, y: torch.Tensor):
+        """Explicit chain-rule backprop — mirrors MLPNumPy._backward exactly."""
+        n = len(y)
+        dW = [None] * len(self.weights)
+        db = [None] * len(self.biases)
+
+        # Output layer delta
+        if self.task == "classification":
+            y_oh = torch.zeros_like(activations[-1])
+            y_oh[torch.arange(n), y.long()] = 1.0
+            delta = (activations[-1] - y_oh) / n       # combined softmax+CE grad / n
+        else:
+            delta = 2 * (activations[-1] - y.unsqueeze(1)) / n
+
+        for l in range(len(self.weights) - 1, -1, -1):
+            dW[l] = activations[l].T @ delta / n if self.task == "regression" \
+                    else activations[l].T @ delta
+            db[l] = delta.sum(dim=0)
+            if l > 0:
+                delta = (delta @ self.weights[l].T) * self._relu_grad(zs[l - 1])
+
+        return dW, db
 
     def fit(self, X, y) -> "MLPTorch":
         """
@@ -185,31 +234,21 @@ class MLPTorch:
         """
         self._init_weights(np.array(X).shape[1])
         X_t = torch.tensor(X, dtype=torch.float32)
+        y_t = torch.tensor(y, dtype=torch.float32)
 
         for _ in range(self.n_iters):
-            logits = self._forward(X_t)
-
-            if self.task == "classification":
-                y_t = torch.tensor(y, dtype=torch.long)
-                # Manual cross-entropy: -log_softmax + NLL
-                log_sum_exp = torch.logsumexp(logits, dim=1)
-                loss = (-logits[torch.arange(len(y_t)), y_t] + log_sum_exp).mean()
-            else:
-                y_t = torch.tensor(y, dtype=torch.float32)
-                loss = ((logits.squeeze() - y_t) ** 2).mean()
-
-            loss.backward()
-            with torch.no_grad():
-                for p in self._params():
-                    p -= self.lr * p.grad
-                    p.grad.zero_()
+            activations, zs = self._forward(X_t)
+            dW, db = self._backward(activations, zs, y_t)
+            for l in range(len(self.weights)):
+                self.weights[l] -= self.lr * dW[l]
+                self.biases[l]  -= self.lr * db[l]
 
         return self
 
     def predict(self, X) -> np.ndarray:
         X_t = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            out = self._forward(X_t)
+        activations, _ = self._forward(X_t)
+        out = activations[-1]
         if self.task == "classification":
             return out.argmax(dim=1).numpy()
         return out.squeeze().numpy()

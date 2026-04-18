@@ -75,9 +75,14 @@ import torch
 
 class LassoRegressionTorch:
     """
-    Lasso regression with raw PyTorch tensors.
-    Uses subgradient descent (L1 is not differentiable at 0, but autograd
-    returns 0 there, which is a valid subgradient).
+    Lasso regression with raw PyTorch tensors and manual subgradient computation.
+    No autograd — gradients derived analytically.
+
+    Forward:  y_hat = X @ w + b
+    Loss:     L = (1/n)*||y_hat - y||^2 + alpha*||w||_1
+    Gradients (subgradient for L1 — sign(0) = 0 is a valid subgradient):
+        dL/dw = (2/n) * X^T @ (y_hat - y)  +  alpha * sign(w)
+        dL/db = (2/n) * sum(y_hat - y)
 
     Parameters
     ----------
@@ -102,26 +107,22 @@ class LassoRegressionTorch:
         y = torch.tensor(y, dtype=torch.float32)
         n, d = X.shape
 
-        self.w = torch.zeros(d, requires_grad=True)
-        self.b = torch.zeros(1, requires_grad=True)
+        self.w = torch.zeros(d)
+        self.b = torch.zeros(1)
 
         for _ in range(self.n_iters):
-            y_hat = X @ self.w + self.b
-            mse = ((y_hat - y) ** 2).mean()
-            l1 = self.alpha * torch.abs(self.w).sum()
-            loss = mse + l1
+            y_hat = X @ self.w + self.b            # (n,)
+            error = y_hat - y                      # (n,)
 
-            loss.backward()
-            with torch.no_grad():
-                self.w -= self.lr * self.w.grad
-                self.b -= self.lr * self.b.grad
-            self.w.grad.zero_()
-            self.b.grad.zero_()
+            dw = (2 / n) * X.T @ error + self.alpha * torch.sign(self.w)  # (d,)
+            db = (2 / n) * error.sum()             # scalar
+
+            self.w -= self.lr * dw
+            self.b -= self.lr * db
 
         return self
 
     def predict(self, X) -> np.ndarray:
         """Returns predictions as numpy array, shape (n_samples,)."""
         X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            return (X @ self.w + self.b).numpy()
+        return (X @ self.w + self.b).numpy()

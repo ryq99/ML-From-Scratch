@@ -121,7 +121,14 @@ import torch
 
 class LogisticRegressionTorch:
     """
-    Binary logistic regression with raw PyTorch tensors.
+    Binary logistic regression with raw PyTorch tensors and manual gradients.
+    No autograd — gradients derived analytically from BCE loss.
+
+    Forward:  p = sigmoid(X @ w + b)
+    Loss:     L = -(1/n) * sum(y*log(p) + (1-y)*log(1-p))
+    Gradients (dL/dw = dL/dp * dp/dz * dz/dw, simplifies to):
+        dL/dw = (1/n) * X^T @ (p - y)
+        dL/db = (1/n) * sum(p - y)
 
     Parameters
     ----------
@@ -135,6 +142,10 @@ class LogisticRegressionTorch:
         self.w: torch.Tensor = None
         self.b: torch.Tensor = None
 
+    @staticmethod
+    def _sigmoid(z: torch.Tensor) -> torch.Tensor:
+        return 1.0 / (1.0 + torch.exp(-torch.clamp(z, -500, 500)))
+
     def fit(self, X, y) -> "LogisticRegressionTorch":
         """
         X : array-like (n_samples, n_features)
@@ -144,29 +155,25 @@ class LogisticRegressionTorch:
         y = torch.tensor(y, dtype=torch.float32)
         n, d = X.shape
 
-        self.w = torch.zeros(d, requires_grad=True)
-        self.b = torch.zeros(1, requires_grad=True)
+        self.w = torch.zeros(d)
+        self.b = torch.zeros(1)
 
         for _ in range(self.n_iters):
-            logits = X @ self.w + self.b
-            p = torch.sigmoid(logits)
-            # Binary cross-entropy
-            loss = -torch.mean(y * torch.log(p + 1e-12) + (1 - y) * torch.log(1 - p + 1e-12))
+            p     = self._sigmoid(X @ self.w + self.b)  # (n,)
+            error = p - y                                # (n,)  = dL/d(logit)
 
-            loss.backward()
-            with torch.no_grad():
-                self.w -= self.lr * self.w.grad
-                self.b -= self.lr * self.b.grad
-            self.w.grad.zero_()
-            self.b.grad.zero_()
+            dw = (1 / n) * X.T @ error                  # (d,)
+            db = (1 / n) * error.sum()                  # scalar
+
+            self.w -= self.lr * dw
+            self.b -= self.lr * db
 
         return self
 
     def predict_proba(self, X) -> np.ndarray:
         """Returns P(y=1|x) as numpy array, shape (n_samples,)."""
         X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            return torch.sigmoid(X @ self.w + self.b).numpy()
+        return self._sigmoid(X @ self.w + self.b).numpy()
 
     def predict(self, X, threshold: float = 0.5) -> np.ndarray:
         """Returns class labels {0, 1}, shape (n_samples,)."""
@@ -175,7 +182,15 @@ class LogisticRegressionTorch:
 
 class SoftmaxRegressionTorch:
     """
-    Multinomial logistic regression with raw PyTorch tensors.
+    Multinomial logistic regression with raw PyTorch tensors and manual gradients.
+    No autograd — gradients derived analytically from softmax + cross-entropy.
+
+    Forward:  P = softmax(X @ W + b)             (n, K)
+    Loss:     L = -(1/n) * sum(Y * log(P))
+    Gradients (combined softmax + CE derivative):
+        dL/dZ = (1/n) * (P - Y)                  (n, K)
+        dL/dW = X^T @ dL/dZ                      (d, K)
+        dL/db = sum(dL/dZ, axis=0)               (K,)
 
     Parameters
     ----------
@@ -190,6 +205,12 @@ class SoftmaxRegressionTorch:
         self.b: torch.Tensor = None
         self.classes_: np.ndarray = None
 
+    @staticmethod
+    def _softmax(z: torch.Tensor) -> torch.Tensor:
+        z = z - z.max(dim=1, keepdim=True).values   # numerically stable
+        exp_z = torch.exp(z)
+        return exp_z / exp_z.sum(dim=1, keepdim=True)
+
     def fit(self, X, y) -> "SoftmaxRegressionTorch":
         """
         X : array-like (n_samples, n_features)
@@ -200,35 +221,29 @@ class SoftmaxRegressionTorch:
         X = torch.tensor(X, dtype=torch.float32)
         n, d = X.shape
 
-        # Build one-hot targets
         label_map = {c: i for i, c in enumerate(self.classes_)}
         y_idx = torch.tensor([label_map[yi] for yi in y], dtype=torch.long)
         Y = torch.zeros(n, K)
-        Y.scatter_(1, y_idx.unsqueeze(1), 1.0)
+        Y.scatter_(1, y_idx.unsqueeze(1), 1.0)      # one-hot (n, K)
 
-        self.W = torch.zeros(d, K, requires_grad=True)
-        self.b = torch.zeros(K, requires_grad=True)
+        self.W = torch.zeros(d, K)
+        self.b = torch.zeros(K)
 
         for _ in range(self.n_iters):
-            logits = X @ self.W + self.b             # (n, K)
-            # Numerically stable softmax cross-entropy
-            log_sum_exp = torch.logsumexp(logits, dim=1, keepdim=True)
-            log_p = logits - log_sum_exp
-            loss = -(Y * log_p).sum(dim=1).mean()
+            P  = self._softmax(X @ self.W + self.b) # (n, K)
+            dZ = (1 / n) * (P - Y)                  # (n, K)  combined CE+softmax grad
 
-            loss.backward()
-            with torch.no_grad():
-                self.W -= self.lr * self.W.grad
-                self.b -= self.lr * self.b.grad
-            self.W.grad.zero_()
-            self.b.grad.zero_()
+            dW = X.T @ dZ                            # (d, K)
+            db = dZ.sum(dim=0)                       # (K,)
+
+            self.W -= self.lr * dW
+            self.b -= self.lr * db
 
         return self
 
     def predict(self, X) -> np.ndarray:
         """Returns predicted class labels, shape (n_samples,)."""
         X = torch.tensor(X, dtype=torch.float32)
-        with torch.no_grad():
-            logits = X @ self.W + self.b
-            idx = torch.argmax(logits, dim=1).numpy()
+        logits = X @ self.W + self.b
+        idx = torch.argmax(logits, dim=1).numpy()
         return self.classes_[idx]
